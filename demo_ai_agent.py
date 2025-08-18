@@ -1,6 +1,9 @@
 from transformers import pipeline
 from typing import Dict, Callable
 import re
+from collections import defaultdict
+from sentence_transformers import SentenceTransformer  # New import for context
+
 
 # ===== Configuration =====
 #MODEL_NAME = "google/flan-t5-small"
@@ -15,18 +18,40 @@ LLM_SETTINGS = {
 # ===== Agent Class =====
 class Agent:
     """Main AI agent that routes prompts to appropriate tools"""
-    def __init__(self):
+    def __init__(self, encoder=None):
         self.llm = pipeline(**LLM_SETTINGS)
         self.tools = self._initialize_tools()
+        self.memory = defaultdict(list)  # NEW: User memory storage
+        self.encoder = encoder or SentenceTransformer("all-MiniLM-L6-v2")
+        self._setup_tool_embeddings()    # NEW: Precompute tool embeddings
 
-    def run(self, prompt: str) -> str:
-        """Process user input and route to appropriate tool"""
-        tool_name = self._choose_tool(prompt)
+     # NEW: Initialize semantic tool matching
+    def _setup_tool_embeddings(self):
+        """Create embeddings for all tool descriptions"""
+        self.tool_embeddings = {
+            name: self.encoder.encode(func.__doc__)
+            for name, func in self.tools.items()
+        }
+
+    def run(self, user_id: str, prompt: str) -> str:  # MODIFIED: Added user_id
+        """
+        Process input with memory and context.
+        Changes:
+        - Now tracks user-specific history
+        - Augments prompt with contextual embeddings
+        """
+        # NEW: Augment prompt with memory and semantic context
+        context = (
+            f"Last tools used: {self.memory[user_id][-2:]}\n"
+            f"Current query: {prompt}"
+        )
+        tool_name = self._choose_tool_with_context(prompt, context)  # MODIFIED
+        result = self.tools[tool_name](prompt)
         
-        if not tool_name:
-            return "Error: Could not select a tool. Try 'search [query]' or 'add X Y'"
-        
-        return self.tools[tool_name](prompt)
+        # NEW: Update memory
+        self.memory[user_id].append((prompt, tool_name))
+        return result
+
 
     def _initialize_tools(self) -> Dict[str, Callable]:
         """Register all available tools"""
@@ -40,8 +65,11 @@ class Agent:
         @self._tool(tools)
         def add_numbers(prompt: str) -> str:
             """
-            Extract numbers from prompt and return their sum
-            Example: "Add 5 and 3" → "Result: 8.0"
+                Mathematical addition for phrases containing: 
+                - Explicit commands: 'add', 'sum', 'total', 'plus', '+'
+                - Equations: '2+3', '5 and 6'
+                - Implicit math: 'combine these numbers'
+                Example inputs: 'Add 5 and 3', 'Total 10 and 20', '2+2'
             """
             numbers = re.findall(r"\d+", prompt)
             if len(numbers) < 2:
@@ -65,6 +93,30 @@ class Agent:
         """Select tool using LLM with keyword fallback"""
         tool_name = self._try_llm_selection(prompt)
         return tool_name if tool_name else self._try_keyword_fallback(prompt)
+
+     # NEW: Context-aware tool selection
+    def _choose_tool_with_context(self, prompt: str, context: str) -> str:
+        """
+        Hybrid selection using:
+        1. Semantic matching (context)
+        2. LLM classification (prompt)
+        3. Keyword fallback
+        """
+        # Try semantic match first
+        prompt_embed = self.encoder.encode(prompt)
+        similarities = {
+            name: prompt_embed.dot(tool_embed)  # Cosine similarity
+            for name, tool_embed in self.tool_embeddings.items()
+        }
+        semantic_tool = max(similarities, key=similarities.get)
+        
+        if similarities[semantic_tool] > 0.3:  # Threshold
+            print(f"Semantic match: {semantic_tool}")
+            return semantic_tool
+        
+        # Fallback to original LLM + keyword flow
+        return self._choose_tool(f"Context:\n{context}\nQuery:{prompt}")
+
 
     def _try_llm_selection(self, prompt: str) -> str:
         """Use LLM to select the appropriate tool"""
@@ -129,11 +181,12 @@ class Agent:
 if __name__ == "__main__":
     agent = Agent()
     
-    # Test cases
-    print(agent.run("Search for cats"))       # Should use search
-    print(agent.run("Add 5 and 3"))           # Should use add_numbers
-    print(agent.run("What's 2+2+2?"))         # Should use add_numbers via keywords
-    print(agent.run("Total 10, 20 and 30"))   # Should use add_numbers via 'total' keyword
-    print(agent.run("Tell a joke"))           # Should fail
-    print(agent.run("Sum 100 1000 900 0"))    # Passed by LLM
-    
+    # Test with user context
+    user = "test_user"
+    print(agent.run(user, "Search for cats"))       # Semantic → search
+    print(agent.run(user, "Add 5 and 3"))           # Semantic → add_numbers
+    print(agent.run(user, "Find dog breeds"))       # Memory-augmented
+    print(agent.run(user, "Total 10 and 20"))       # Uses previous 'add' context
+    print(agent.run(user, "combine 10000 and 20"))
+    print(agent.run(user, "What's the sum of the first 10 prime numbers multiplied by 3?"))
+    print(agent.run(user, "Where is Kolakta"))
